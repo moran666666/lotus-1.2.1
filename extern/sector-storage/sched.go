@@ -256,8 +256,28 @@ func (sh *scheduler) runSched() {
 	}
 }
 
+func (sh *scheduler) diag() SchedDiagInfo {
+	var out SchedDiagInfo
 
-4.3、将“func (sh *scheduler) trySched(”整个函数修改为：
+	for sqi := 0; sqi < sh.schedQueue.Len(); sqi++ {
+		task := (*sh.schedQueue)[sqi]
+
+		out.Requests = append(out.Requests, SchedDiagRequestInfo{
+			Sector:   task.sector.ID,
+			TaskType: task.taskType,
+			Priority: task.priority,
+		})
+	}
+
+	sh.workersLk.RLock()
+	defer sh.workersLk.RUnlock()
+
+	for _, window := range sh.openWindows {
+		out.OpenWindows = append(out.OpenWindows, uuid.UUID(window.worker).String())
+	}
+
+	return out
+}
 
 func (sh *scheduler) trySched() {
 	sh.workersLk.Lock()
@@ -397,229 +417,6 @@ func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequ
 	}()
 
 	return nil
-}
-
-func (sh *scheduler) diag() SchedDiagInfo {
-	var out SchedDiagInfo
-
-	for sqi := 0; sqi < sh.schedQueue.Len(); sqi++ {
-		task := (*sh.schedQueue)[sqi]
-
-		out.Requests = append(out.Requests, SchedDiagRequestInfo{
-			Sector:   task.sector.ID,
-			TaskType: task.taskType,
-			Priority: task.priority,
-		})
-	}
-
-	sh.workersLk.RLock()
-	defer sh.workersLk.RUnlock()
-
-	for _, window := range sh.openWindows {
-		out.OpenWindows = append(out.OpenWindows, uuid.UUID(window.worker).String())
-	}
-
-	return out
-}
-
-func (sh *scheduler) trySched() {
-	/*
-		This assigns tasks to workers based on:
-		- Task priority (achieved by handling sh.schedQueue in order, since it's already sorted by priority)
-		- Worker resource availability
-		- Task-specified worker preference (acceptableWindows array below sorted by this preference)
-		- Window request age
-
-		1. For each task in the schedQueue find windows which can handle them
-		1.1. Create list of windows capable of handling a task
-		1.2. Sort windows according to task selector preferences
-		2. Going through schedQueue again, assign task to first acceptable window
-		   with resources available
-		3. Submit windows with scheduled tasks to workers
-
-	*/
-
-	sh.workersLk.RLock()
-	defer sh.workersLk.RUnlock()
-
-	windows := make([]schedWindow, len(sh.openWindows))
-	acceptableWindows := make([][]int, sh.schedQueue.Len())
-
-	log.Debugf("SCHED %d queued; %d open windows", sh.schedQueue.Len(), len(windows))
-
-	if len(sh.openWindows) == 0 {
-		// nothing to schedule on
-		return
-	}
-
-	// Step 1
-	concurrency := len(sh.openWindows)
-	throttle := make(chan struct{}, concurrency)
-
-	var wg sync.WaitGroup
-	wg.Add(sh.schedQueue.Len())
-
-	for i := 0; i < sh.schedQueue.Len(); i++ {
-		throttle <- struct{}{}
-
-		go func(sqi int) {
-			defer wg.Done()
-			defer func() {
-				<-throttle
-			}()
-
-			task := (*sh.schedQueue)[sqi]
-			needRes := ResourceTable[task.taskType][task.sector.ProofType]
-
-			task.indexHeap = sqi
-			for wnd, windowRequest := range sh.openWindows {
-				worker, ok := sh.workers[windowRequest.worker]
-				if !ok {
-					log.Errorf("worker referenced by windowRequest not found (worker: %s)", windowRequest.worker)
-					// TODO: How to move forward here?
-					continue
-				}
-
-				if !worker.enabled {
-					log.Debugw("skipping disabled worker", "worker", windowRequest.worker)
-					continue
-				}
-
-				// TODO: allow bigger windows
-				if !windows[wnd].allocated.canHandleRequest(needRes, windowRequest.worker, "schedAcceptable", worker.info.Resources) {
-					continue
-				}
-
-				rpcCtx, cancel := context.WithTimeout(task.ctx, SelectorTimeout)
-				ok, err := task.sel.Ok(rpcCtx, task.taskType, task.sector.ProofType, worker)
-				cancel()
-				if err != nil {
-					log.Errorf("trySched(1) req.sel.Ok error: %+v", err)
-					continue
-				}
-
-				if !ok {
-					continue
-				}
-
-				acceptableWindows[sqi] = append(acceptableWindows[sqi], wnd)
-			}
-
-			if len(acceptableWindows[sqi]) == 0 {
-				return
-			}
-
-			// Pick best worker (shuffle in case some workers are equally as good)
-			rand.Shuffle(len(acceptableWindows[sqi]), func(i, j int) {
-				acceptableWindows[sqi][i], acceptableWindows[sqi][j] = acceptableWindows[sqi][j], acceptableWindows[sqi][i] // nolint:scopelint
-			})
-			sort.SliceStable(acceptableWindows[sqi], func(i, j int) bool {
-				wii := sh.openWindows[acceptableWindows[sqi][i]].worker // nolint:scopelint
-				wji := sh.openWindows[acceptableWindows[sqi][j]].worker // nolint:scopelint
-
-				if wii == wji {
-					// for the same worker prefer older windows
-					return acceptableWindows[sqi][i] < acceptableWindows[sqi][j] // nolint:scopelint
-				}
-
-				wi := sh.workers[wii]
-				wj := sh.workers[wji]
-
-				rpcCtx, cancel := context.WithTimeout(task.ctx, SelectorTimeout)
-				defer cancel()
-
-				r, err := task.sel.Cmp(rpcCtx, task.taskType, wi, wj)
-				if err != nil {
-					log.Error("selecting best worker: %s", err)
-				}
-				return r
-			})
-		}(i)
-	}
-
-	wg.Wait()
-
-	log.Debugf("SCHED windows: %+v", windows)
-	log.Debugf("SCHED Acceptable win: %+v", acceptableWindows)
-
-	// Step 2
-	scheduled := 0
-
-	for sqi := 0; sqi < sh.schedQueue.Len(); sqi++ {
-		task := (*sh.schedQueue)[sqi]
-		needRes := ResourceTable[task.taskType][task.sector.ProofType]
-
-		selectedWindow := -1
-		for _, wnd := range acceptableWindows[task.indexHeap] {
-			wid := sh.openWindows[wnd].worker
-			wr := sh.workers[wid].info.Resources
-
-			log.Debugf("SCHED try assign sqi:%d sector %d to window %d", sqi, task.sector.ID.Number, wnd)
-
-			// TODO: allow bigger windows
-			if !windows[wnd].allocated.canHandleRequest(needRes, wid, "schedAssign", wr) {
-				continue
-			}
-
-			log.Debugf("SCHED ASSIGNED sqi:%d sector %d task %s to window %d", sqi, task.sector.ID.Number, task.taskType, wnd)
-
-			windows[wnd].allocated.add(wr, needRes)
-			// TODO: We probably want to re-sort acceptableWindows here based on new
-			//  workerHandle.utilization + windows[wnd].allocated.utilization (workerHandle.utilization is used in all
-			//  task selectors, but not in the same way, so need to figure out how to do that in a non-O(n^2 way), and
-			//  without additional network roundtrips (O(n^2) could be avoided by turning acceptableWindows.[] into heaps))
-
-			selectedWindow = wnd
-			break
-		}
-
-		if selectedWindow < 0 {
-			// all windows full
-			continue
-		}
-
-		windows[selectedWindow].todo = append(windows[selectedWindow].todo, task)
-
-		sh.schedQueue.Remove(sqi)
-		sqi--
-		scheduled++
-	}
-
-	// Step 3
-
-	if scheduled == 0 {
-		return
-	}
-
-	scheduledWindows := map[int]struct{}{}
-	for wnd, window := range windows {
-		if len(window.todo) == 0 {
-			// Nothing scheduled here, keep the window open
-			continue
-		}
-
-		scheduledWindows[wnd] = struct{}{}
-
-		window := window // copy
-		select {
-		case sh.openWindows[wnd].done <- &window:
-		default:
-			log.Error("expected sh.openWindows[wnd].done to be buffered")
-		}
-	}
-
-	// Rewrite sh.openWindows array, removing scheduled windows
-	newOpenWindows := make([]*schedWindowRequest, 0, len(sh.openWindows)-len(scheduledWindows))
-	for wnd, window := range sh.openWindows {
-		if _, scheduled := scheduledWindows[wnd]; scheduled {
-			// keep unscheduled windows open
-			continue
-		}
-
-		newOpenWindows = append(newOpenWindows, window)
-	}
-
-	sh.openWindows = newOpenWindows
 }
 
 func (sh *scheduler) schedClose() {
