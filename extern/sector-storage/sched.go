@@ -2,7 +2,6 @@ package sectorstorage
 
 import (
 	"context"
-	"math/rand"
 	"sync"
 	"time"
 
