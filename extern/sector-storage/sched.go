@@ -3,7 +3,6 @@ package sectorstorage
 import (
 	"context"
 	"math/rand"
-	"sort"
 	"sync"
 	"time"
 
@@ -49,6 +48,7 @@ type WorkerSelector interface {
 	Ok(ctx context.Context, task sealtasks.TaskType, spt abi.RegisteredSealProof, a *workerHandle) (bool, error) // true if worker is acceptable for performing a task
 
 	Cmp(ctx context.Context, task sealtasks.TaskType, a, b *workerHandle) (bool, error) // true if a is preferred over b
+	FindDataWoker(ctx context.Context, task sealtasks.TaskType, sid abi.SectorID, spt abi.RegisteredSealProof, a *workerHandle) bool
 }
 
 type scheduler struct {
@@ -92,6 +92,7 @@ type workerHandle struct {
 	cleanupStarted bool
 	closedMgr      chan struct{}
 	closingMgr     chan struct{}
+	workerOnFree   chan struct{}
 }
 
 type schedWindowRequest struct {
@@ -220,89 +221,182 @@ type SchedDiagInfo struct {
 
 func (sh *scheduler) runSched() {
 	defer close(sh.closed)
-
-	iw := time.After(InitWait)
-	var initialised bool
+	go func() {
+		for {
+			time.Sleep(time.Second * 180) // 3分钟执行一次
+			sh.workersLk.Lock()
+			if sh.schedQueue.Len() > 0 {
+				sh.windowRequests <- &schedWindowRequest{}
+			}
+			sh.workersLk.Unlock()
+		}
+	}()
 
 	for {
-		var doSched bool
-		var toDisable []workerDisableReq
-
 		select {
 		case <-sh.workerChange:
-			doSched = true
-		case dreq := <-sh.workerDisable:
-			toDisable = append(toDisable, dreq)
-			doSched = true
+			sh.trySched()
+		case <-sh.workerDisable:
+			sh.trySched()
 		case req := <-sh.schedule:
 			sh.schedQueue.Push(req)
-			doSched = true
+			sh.trySched()
 
 			if sh.testSync != nil {
 				sh.testSync <- struct{}{}
 			}
-		case req := <-sh.windowRequests:
-			sh.openWindows = append(sh.openWindows, req)
-			doSched = true
+		case <-sh.windowRequests:
+			sh.trySched()
 		case ireq := <-sh.info:
 			ireq(sh.diag())
-
-		case <-iw:
-			initialised = true
-			iw = nil
-			doSched = true
 		case <-sh.closing:
 			sh.schedClose()
 			return
 		}
+	}
+}
 
-		if doSched && initialised {
-			// First gather any pending tasks, so we go through the scheduling loop
-			// once for every added task
-		loop:
-			for {
-				select {
-				case <-sh.workerChange:
-				case dreq := <-sh.workerDisable:
-					toDisable = append(toDisable, dreq)
-				case req := <-sh.schedule:
-					sh.schedQueue.Push(req)
-					if sh.testSync != nil {
-						sh.testSync <- struct{}{}
-					}
-				case req := <-sh.windowRequests:
-					sh.openWindows = append(sh.openWindows, req)
-				default:
-					break loop
+
+4.3、将“func (sh *scheduler) trySched(”整个函数修改为：
+
+func (sh *scheduler) trySched() {
+	sh.workersLk.Lock()
+	defer sh.workersLk.Unlock()
+
+	log.Debugf("trySched %d queued", sh.schedQueue.Len())
+	for sqi := 0; sqi < sh.schedQueue.Len(); sqi++ { // 遍历任务列表
+		task := (*sh.schedQueue)[sqi]
+
+		tried := 0
+		var acceptable []WorkerID
+		var freetable []int
+		best := 0
+		localWorker := false
+		for wid, worker := range sh.workers {
+			if task.taskType == sealtasks.TTPreCommit2 || task.taskType == sealtasks.TTCommit1 {
+				if isExist := task.sel.FindDataWoker(task.ctx, task.taskType, task.sector.ID, task.sector.ProofType, worker); !isExist {
+					continue
 				}
 			}
 
-			for _, req := range toDisable {
-				for _, window := range req.activeWindows {
-					for _, request := range window.todo {
-						sh.schedQueue.Push(request)
-					}
-				}
-
-				openWindows := make([]*schedWindowRequest, 0, len(sh.openWindows))
-				for _, window := range sh.openWindows {
-					if window.worker != req.wid {
-						openWindows = append(openWindows, window)
-					}
-				}
-				sh.openWindows = openWindows
-
-				sh.workersLk.Lock()
-				sh.workers[req.wid].enabled = false
-				sh.workersLk.Unlock()
-
-				req.done()
+			ok, err := task.sel.Ok(task.ctx, task.taskType, task.sector.ProofType, worker)
+			if err != nil || !ok {
+				continue
 			}
 
-			sh.trySched()
+			freecount := sh.getTaskFreeCount(wid, task.taskType)
+			if freecount <= 0 {
+				continue
+			}
+			tried++
+			freetable = append(freetable, freecount)
+			acceptable = append(acceptable, wid)
+
+			if isExist := task.sel.FindDataWoker(task.ctx, task.taskType, task.sector.ID, task.sector.ProofType, worker); isExist {
+				localWorker = true
+				break
+			}
 		}
 
+		if len(acceptable) > 0 {
+			if localWorker {
+				best = len(acceptable) - 1
+			} else {
+				max := 0
+				for i, v := range freetable {
+					if v > max {
+						max = v
+						best = i
+					}
+				}
+			}
+
+			wid := acceptable[best]
+			whl := sh.workers[wid]
+			log.Infof("worker %s will be do the %+v jobTask!", whl.info.Hostname, task.taskType)
+			sh.schedQueue.Remove(sqi)
+			sqi--
+			if err := sh.assignWorker(wid, whl, task); err != nil {
+				log.Error("assignWorker error: %+v", err)
+				go task.respond(xerrors.Errorf("assignWorker error: %w", err))
+			}
+		}
+
+		if tried == 0 {
+			log.Infof("no worker do the %+v jobTask!", task.taskType)
+		}
 	}
+}
+
+func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequest) error {
+	sh.taskAddOne(wid, req.taskType)
+	needRes := ResourceTable[req.taskType][req.sector.ProofType]
+
+	w.lk.Lock()
+	w.preparing.add(w.info.Resources, needRes)
+	w.lk.Unlock()
+
+	go func() {
+		defer sh.taskReduceOne(wid, req.taskType)
+		err := req.prepare(req.ctx, sh.workTracker.worker(wid, w.workerRpc)) // fetch扇区
+		sh.workersLk.Lock()
+
+		if err != nil {
+			w.lk.Lock()
+			w.preparing.free(w.info.Resources, needRes)
+			w.lk.Unlock()
+			sh.workersLk.Unlock()
+
+			select {
+			case w.workerOnFree <- struct{}{}:
+			case <-sh.closing:
+				log.Warnf("scheduler closed while sending response (prepare error: %+v)", err)
+			}
+
+			select {
+			case req.ret <- workerResponse{err: err}:
+			case <-req.ctx.Done():
+				log.Warnf("request got cancelled before we could respond (prepare error: %+v)", err)
+			case <-sh.closing:
+				log.Warnf("scheduler closed while sending response (prepare error: %+v)", err)
+			}
+			return
+		}
+
+		err = w.active.withResources(wid, w.info.Resources, needRes, &sh.workersLk, func() error {
+			w.lk.Lock()
+			w.preparing.free(w.info.Resources, needRes)
+			w.lk.Unlock()
+			sh.workersLk.Unlock()
+			defer sh.workersLk.Lock() // we MUST return locked from this function
+
+			select {
+			case w.workerOnFree <- struct{}{}:
+			case <-sh.closing:
+			}
+
+			err = req.work(req.ctx, sh.workTracker.worker(wid, w.workerRpc)) // 调用传进来的函数进行任务处理
+
+			select {
+			case req.ret <- workerResponse{err: err}:
+			case <-req.ctx.Done():
+				log.Warnf("request got cancelled before we could respond")
+			case <-sh.closing:
+				log.Warnf("scheduler closed while sending response")
+			}
+
+			return nil
+		})
+
+		sh.workersLk.Unlock()
+
+		// This error should always be nil, since nothing is setting it, but just to be safe:
+		if err != nil {
+			log.Errorf("error executing worker (withResources): %+v", err)
+		}
+	}()
+
+	return nil
 }
 
 func (sh *scheduler) diag() SchedDiagInfo {
@@ -561,4 +655,86 @@ func (sh *scheduler) Close(ctx context.Context) error {
 		return ctx.Err()
 	}
 	return nil
+}
+
+func (sh *scheduler) taskAddOne(wid WorkerID, phaseTaskType sealtasks.TaskType) {
+	if whl, ok := sh.workers[wid]; ok {
+		whl.info.TaskResourcesLk.Lock()
+		defer whl.info.TaskResourcesLk.Unlock()
+		if counts, ok := whl.info.TaskResources[phaseTaskType]; ok {
+			counts.RunCount++
+		}
+	}
+}
+
+func (sh *scheduler) taskReduceOne(wid WorkerID, phaseTaskType sealtasks.TaskType) {
+	if whl, ok := sh.workers[wid]; ok {
+		whl.info.TaskResourcesLk.Lock()
+		defer whl.info.TaskResourcesLk.Unlock()
+		if counts, ok := whl.info.TaskResources[phaseTaskType]; ok {
+			counts.RunCount--
+		}
+	}
+}
+
+func (sh *scheduler) getTaskCount(wid WorkerID, phaseTaskType sealtasks.TaskType, typeCount string) int {
+	if whl, ok := sh.workers[wid]; ok {
+		if counts, ok := whl.info.TaskResources[phaseTaskType]; ok {
+			whl.info.TaskResourcesLk.Lock()
+			defer whl.info.TaskResourcesLk.Unlock()
+			if typeCount == "limit" {
+				return counts.LimitCount
+			}
+			if typeCount == "run" {
+				return counts.RunCount
+			}
+		}
+	}
+	return 0
+}
+
+func (sh *scheduler) getTaskFreeCount(wid WorkerID, phaseTaskType sealtasks.TaskType) int {
+	limitCount := sh.getTaskCount(wid, phaseTaskType, "limit") // json文件限制的任务数量
+	runCount := sh.getTaskCount(wid, phaseTaskType, "run")     // 运行中的任务数量
+	freeCount := limitCount - runCount
+
+	if limitCount == 0 { // 0:禁止
+		return 0
+	}
+
+	whl := sh.workers[wid]
+	log.Infof("worker %s %s: %d free count", whl.info.Hostname, phaseTaskType, freeCount)
+
+	if phaseTaskType == sealtasks.TTAddPiece || phaseTaskType == sealtasks.TTPreCommit1 {
+		if freeCount >= 0 { // 空闲数量不小于0，小于0也要校准为0
+			return freeCount
+		}
+		return 0
+	}
+
+	if phaseTaskType == sealtasks.TTPreCommit2 || phaseTaskType == sealtasks.TTCommit1 {
+		c2runCount := sh.getTaskCount(wid, sealtasks.TTCommit2, "run")
+		if freeCount >= 0 && c2runCount <= 0 { // 需做的任务空闲数量不小于0，且没有c2任务在运行
+			return freeCount
+		}
+		log.Infof("worker already doing C2 taskjob")
+		return 0
+	}
+
+	if phaseTaskType == sealtasks.TTCommit2 {
+		p2runCount := sh.getTaskCount(wid, sealtasks.TTPreCommit2, "run")
+		c1runCount := sh.getTaskCount(wid, sealtasks.TTCommit1, "run")
+		if freeCount >= 0 && p2runCount <= 0 && c1runCount <= 0 { // 需做的任务空闲数量不小于0，且没有p2\c1任务在运行
+			return freeCount
+		}
+		log.Infof("worker already doing P2C1 taskjob")
+		return 0
+	}
+
+	if phaseTaskType == sealtasks.TTFetch || phaseTaskType == sealtasks.TTFinalize ||
+		phaseTaskType == sealtasks.TTUnseal || phaseTaskType == sealtasks.TTReadUnsealed { // 不限制
+		return 1
+	}
+
+	return 0
 }
