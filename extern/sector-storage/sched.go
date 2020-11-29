@@ -302,6 +302,10 @@ func (sh *scheduler) trySched() {
 		best := 0
 		localWorker := false
 		for wid, worker := range sh.workers {
+			if !worker.enabled {
+				continue
+			}
+			
 			if task.taskType == sealtasks.TTPreCommit2 || task.taskType == sealtasks.TTCommit1 {
 				if isExist := task.sel.FindDataWoker(task.ctx, task.taskType, task.sector.ID, task.sector.ProofType, worker); !isExist {
 					continue
