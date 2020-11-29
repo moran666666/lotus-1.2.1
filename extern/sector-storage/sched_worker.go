@@ -151,6 +151,7 @@ func (sw *schedWorker) disable(ctx context.Context) error {
 	// request cleanup in the main scheduler goroutine
 	select {
 	case sw.sched.workerDisable <- workerDisableReq{
+		todo:          sw.worker.todo,
 		activeWindows: sw.worker.activeWindows,
 		wid:           sw.wid,
 		done: func() {
