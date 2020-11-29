@@ -385,6 +385,12 @@ func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequ
 
 			select {
 			case req.ret <- workerResponse{err: err}:
+				for i := 0; i < len(w.todo); i++ {
+					if w.todo[i] == req {
+						w.todo = append(w.todo[:i], w.todo[i+1:]...)
+						break
+					}
+				}
 			case <-req.ctx.Done():
 				log.Warnf("request got cancelled before we could respond (prepare error: %+v)", err)
 			case <-sh.closing:
@@ -409,6 +415,12 @@ func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequ
 
 			select {
 			case req.ret <- workerResponse{err: err}:
+				for i := 0; i < len(w.todo); i++ {
+					if w.todo[i] == req {
+						w.todo = append(w.todo[:i], w.todo[i+1:]...)
+						break
+					}
+				}
 			case <-req.ctx.Done():
 				log.Warnf("request got cancelled before we could respond")
 			case <-sh.closing:
