@@ -92,6 +92,7 @@ type workerHandle struct {
 	closedMgr      chan struct{}
 	closingMgr     chan struct{}
 	workerOnFree   chan struct{}
+	todo           []*workerRequest
 }
 
 type schedWindowRequest struct {
@@ -106,6 +107,7 @@ type schedWindow struct {
 }
 
 type workerDisableReq struct {
+	todo          []*workerRequest
 	activeWindows []*schedWindow
 	wid           WorkerID
 	done          func()
@@ -235,7 +237,15 @@ func (sh *scheduler) runSched() {
 		select {
 		case <-sh.workerChange:
 			sh.trySched()
-		case <-sh.workerDisable:
+		case toDisable := <-sh.workerDisable:
+			for _, request := range toDisable.todo {
+				sh.schedQueue.Push(request)
+			}
+			sh.workersLk.Lock()
+			sh.workers[toDisable.wid].enabled = false
+			sh.workersLk.Unlock()
+			toDisable.done()
+			
 			sh.trySched()
 		case req := <-sh.schedule:
 			sh.schedQueue.Push(req)
@@ -348,6 +358,7 @@ func (sh *scheduler) trySched() {
 }
 
 func (sh *scheduler) assignWorker(wid WorkerID, w *workerHandle, req *workerRequest) error {
+	w.todo = append(w.todo, req)
 	sh.taskAddOne(wid, req.taskType)
 	needRes := ResourceTable[req.taskType][req.sector.ProofType]
 
