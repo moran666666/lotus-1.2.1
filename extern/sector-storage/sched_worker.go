@@ -48,6 +48,7 @@ func (sh *scheduler) runWorker(ctx context.Context, w Worker) error {
 		closingMgr:   make(chan struct{}),
 		closedMgr:    make(chan struct{}),
 		workerOnFree: make(chan struct{}),
+		todo:         make([]*workerRequest, 0),
 	}
 
 	wid := WorkerID(sessID)
